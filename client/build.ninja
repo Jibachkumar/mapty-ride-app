@@ -1,0 +1,4 @@
+rule cc
+  command = "C:/Users/Asus/AppData/Local/Android/Sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe" -c test.cpp -o test.obj
+
+build test.obj: cc test.cpp
