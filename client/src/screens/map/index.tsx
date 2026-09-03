@@ -7,7 +7,7 @@ import {
   Pressable,
 } from "react-native";
 import * as Location from "expo-location";
-import MapScreenView from "./map-view";
+import MapScreenView, { type MapScreenViewHandle } from "./map-view";
 import Slider from "@react-native-community/slider";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -27,6 +27,17 @@ type RouteTurn = {
   direction: "left" | "right";
 };
 
+type RouteJunction = {
+  distanceFromStart: number;
+  location: Coordinates;
+  junctionType: "3-way" | "4-way" | "other";
+  roads: number;
+  maneuverType: string;
+  maneuverModifier?: string;
+  incomingBearing?: number;
+  outgoingBearing?: number;
+};
+
 const MapScreen = () => {
   const [location, setLocation] = useState<Location.LocationObject | null>(
     null,
@@ -34,9 +45,20 @@ const MapScreen = () => {
 
   const [destination, setDestination] = useState<Coordinates | null>(null);
 
+  const [customOrigin, setCustomOrigin] = useState<Coordinates | null>(null);
+  const [isPickingOrigin, setIsPickingOrigin] = useState(false);
+
   const [routeCoordinates, setRouteCoordinates] = useState<RoutePoint[]>([]);
 
   const simulationDistanceRef = useRef(0);
+  const routeGenerationRef = useRef(0);
+
+  const routeJunctionsRef = useRef<RouteJunction[]>([]);
+
+  const [isNavigationView, setIsNavigationView] = useState(false);
+  const mapViewRef = useRef<MapScreenViewHandle>(null);
+
+  const [isSatelliteView, setIsSatelliteView] = useState(false);
 
   const [simulationPosition, setSimulationPosition] =
     useState<Coordinates | null>(null);
@@ -60,6 +82,10 @@ const MapScreen = () => {
 
   const groupedTurnsRef = useRef<RouteTurn[]>([]);
   const [groupedTurns, setGropedTurns] = useState([]);
+
+  const [isInfoCardVisible, setIsInfoCardVisible] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const navigationStartRef = useRef<number | null>(null);
 
   const simulationSpeedRef = useRef(0);
   const baseSpeedRef = useRef(baseSpeed);
@@ -147,6 +173,35 @@ const MapScreen = () => {
       subscription?.remove();
     };
   }, []);
+
+  useEffect(() => {
+    if (isNavigating && !isPaused) {
+      if (navigationStartRef.current === null) {
+        navigationStartRef.current = Date.now();
+      }
+    }
+
+    if (!isNavigating) {
+      navigationStartRef.current = null;
+      setElapsedSeconds(0);
+    }
+  }, [isNavigating, isPaused]);
+
+  useEffect(() => {
+    if (!isInfoCardVisible) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      if (navigationStartRef.current !== null) {
+        setElapsedSeconds(
+          Math.floor((Date.now() - navigationStartRef.current) / 1000),
+        );
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [isInfoCardVisible]);
 
   // calculating geometry distance
   const calculateDistance = (
@@ -405,6 +460,65 @@ const MapScreen = () => {
     );
   };
 
+  const findJunctionDistance = (route: RoutePoint[], location: number[]) => {
+    let closestIndex = 0;
+    let closestDistance = Infinity;
+
+    route.forEach((point, index) => {
+      const distance = calculateDistance(point, {
+        latitude: location[1],
+        longitude: location[0],
+      });
+
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestIndex = index;
+      }
+    });
+
+    return route[closestIndex].distanceFromStart;
+  };
+
+  const getUpcomingJunction = (
+    currentDistance: number,
+    junctions: RouteJunction[],
+  ): RouteJunction | null => {
+    const upcoming = junctions
+      .filter((junction) => junction.distanceFromStart > currentDistance)
+      .sort((a, b) => a.distanceFromStart - b.distanceFromStart);
+
+    return upcoming[0] ?? null;
+  };
+
+  const getJunctionSpeedMultiplier = (junctionType: string) => {
+    if (junctionType === "3-way") return 0.75;
+    if (junctionType === "4-way") return 0.625;
+    return 1;
+  };
+
+  const getSimulatedHeading = (
+    route: RoutePoint[],
+    distanceAlongRoute: number,
+  ): number | null => {
+    if (route.length < 2) {
+      return null;
+    }
+
+    let segmentIndex = 1;
+
+    for (let i = 1; i < route.length; i++) {
+      if (distanceAlongRoute <= route[i].distanceFromStart) {
+        segmentIndex = i;
+        break;
+      }
+    }
+
+    const previousPoint = route[segmentIndex - 1];
+    const currentPoint = route[segmentIndex];
+
+    return calculateBearing(previousPoint, currentPoint);
+  };
+
   const interpolatePosition = (
     route: RoutePoint[],
     distanceAlongRoute: number,
@@ -435,10 +549,6 @@ const MapScreen = () => {
       };
     }
 
-    /*
-     * Find the two route points surrounding
-     * the requested distance.
-     */
     for (let i = 1; i < route.length; i++) {
       const previousPoint = route[i - 1];
       const currentPoint = route[i];
@@ -447,16 +557,6 @@ const MapScreen = () => {
         const segmentDistance =
           currentPoint.distanceFromStart - previousPoint.distanceFromStart;
 
-        /*
-         * Position within this particular segment.
-         *
-         * Example:
-         *
-         * segment = 20 meters
-         * already travelled = 5 meters
-         *
-         * t = 0.25
-         */
         const distanceIntoSegment =
           distanceAlongRoute - previousPoint.distanceFromStart;
 
@@ -508,6 +608,31 @@ const MapScreen = () => {
       // 1. Get current simulation distance
       const currentDistance = simulationDistanceRef.current;
 
+      const upcomingJunction = getUpcomingJunction(
+        currentDistance,
+        routeJunctionsRef.current,
+      );
+
+      if (upcomingJunction) {
+        const distanceToJunction =
+          upcomingJunction.distanceFromStart - currentDistance;
+
+        const junctionMultiplier = getJunctionSpeedMultiplier(
+          upcomingJunction.junctionType,
+        );
+
+        const junctionTargetSpeed = baseSpeedRef.current * junctionMultiplier;
+
+        console.log(
+          "JUNCTION:",
+          upcomingJunction.junctionType,
+          `base=${baseSpeedRef.current.toFixed(1)}`,
+          `multiplier=${junctionMultiplier.toFixed(3)}`,
+          `target=${junctionTargetSpeed.toFixed(1)}km/h`,
+          `in=${distanceToJunction.toFixed(1)}m`,
+        );
+      }
+
       // 2. Find the upcoming turn
       const upcomingTurn = getUpcomingTurn(
         currentDistance,
@@ -549,13 +674,13 @@ const MapScreen = () => {
 
         console.log("Turn speed:", `${turnSpeed.toFixed(1)} km/h`);
 
-        console.log(
-          "Braking distance:",
-          `${brakingDistance.toFixed(1)}m`,
-          "+ buffer=5m",
-        );
+        // console.log(
+        //   "Braking distance:",
+        //   `${brakingDistance.toFixed(1)}m`,
+        //   "+ buffer=5m",
+        // );
 
-        console.log("Braking trigger:", `${brakingTrigger.toFixed(1)}m`);
+        // console.log("Braking trigger:", `${brakingTrigger.toFixed(1)}m`);
 
         console.log("Target speed:", `${targetSpeedKmh.toFixed(1)} km/h`);
       } else {
@@ -569,15 +694,42 @@ const MapScreen = () => {
           distanceToDestination,
         );
 
-        console.log(
-          "No upcoming turn.",
-          `Destination in=${distanceToDestination.toFixed(1)}m`,
+        // console.log(
+        //   "No upcoming turn.",
+        //   `Destination in=${distanceToDestination.toFixed(1)}m`,
+        // );
+
+        // console.log(
+        //   "Destination target speed:",
+        //   `${targetSpeedKmh.toFixed(1)} km/h`,
+        // );
+      }
+
+      // NEW: junction speed constraint
+      if (upcomingJunction) {
+        const junctionMultiplier = getJunctionSpeedMultiplier(
+          upcomingJunction.junctionType,
         );
 
-        console.log(
-          "Destination target speed:",
-          `${targetSpeedKmh.toFixed(1)} km/h`,
-        );
+        const junctionTargetSpeed = baseSpeedRef.current * junctionMultiplier;
+
+        const distanceToJunction =
+          upcomingJunction.distanceFromStart - currentDistance;
+
+        // Start reducing speed only when we're
+        // within this distance of the junction.
+        const JUNCTION_BRAKING_START = 40; // meters
+
+        if (distanceToJunction <= JUNCTION_BRAKING_START) {
+          const approachProgress =
+            1 - Math.max(0, distanceToJunction / JUNCTION_BRAKING_START);
+
+          const approachTarget =
+            baseSpeedRef.current -
+            (baseSpeedRef.current - junctionTargetSpeed) * approachProgress;
+
+          targetSpeedKmh = Math.min(targetSpeedKmh, approachTarget);
+        }
       }
 
       // 4. Convert target speed to m/s
@@ -624,9 +776,9 @@ const MapScreen = () => {
 
       setSimulationSpeed(currentSpeedKmh);
 
-      console.log("Simulation speed:", currentSpeedKmh.toFixed(1), "km/h");
+      // console.log("Simulation speed:", currentSpeedKmh.toFixed(1), "km/h");
 
-      console.log("Simulation distance:", updatedDistance.toFixed(2), "m");
+      // console.log("Simulation distance:", updatedDistance.toFixed(2), "m");
 
       // 10. Distance remaining
       const remaining = lastPoint.distanceFromStart - updatedDistance;
@@ -635,7 +787,7 @@ const MapScreen = () => {
 
       setDistanceRemaining(safeRemaining);
 
-      console.log("Distance remaining:", safeRemaining.toFixed(2), "m");
+      // console.log("Distance remaining:", safeRemaining.toFixed(2), "m");
 
       // 11. ETA
       const estimatedTimeRemaining =
@@ -643,7 +795,7 @@ const MapScreen = () => {
 
       setEta(estimatedTimeRemaining);
 
-      console.log("ETA:", estimatedTimeRemaining.toFixed(2), "seconds");
+      // console.log("ETA:", estimatedTimeRemaining.toFixed(2), "seconds");
 
       // 12. Progress
       const totalDistance = lastPoint.distanceFromStart;
@@ -655,13 +807,13 @@ const MapScreen = () => {
 
       setProgress(currentProgress);
 
-      console.log("Progress:", currentProgress.toFixed(2), "%");
+      // console.log("Progress:", currentProgress.toFixed(2), "%");
 
       // 13. Calculate simulated position
       // This does NOT control a marker.
       const position = interpolatePosition(routeCoordinates, updatedDistance);
 
-      console.log("Simulation:", updatedDistance, "m →", position);
+      // console.log("Simulation:", updatedDistance, "m →", position);
 
       setSimulationPosition(position);
 
@@ -698,7 +850,8 @@ const MapScreen = () => {
     };
   }, [isNavigating, isPaused, routeCoordinates]);
 
-  const handleRouteReady = (coordinates: number[][]) => {
+  const handleRouteReady = (coordinates: number[][], junctions: any[]) => {
+    console.log("PARENT RECEIVED JUNCTIONS:", junctions);
     console.log("OSRM route received:", coordinates.length, "points");
 
     const convertedRoute: Coordinates[] = coordinates.map(
@@ -732,6 +885,18 @@ const MapScreen = () => {
         };
       },
     );
+
+    const junctionsWithDistance = junctions.map((junction) => ({
+      ...junction,
+      distanceFromStart: findJunctionDistance(
+        routeWithDistances,
+        junction.location,
+      ),
+    }));
+
+    routeJunctionsRef.current = junctionsWithDistance;
+
+    console.log("JUNCTIONS WITH DISTANCE:", junctionsWithDistance);
 
     console.log(
       "Route total calculated distance:",
@@ -789,6 +954,8 @@ const MapScreen = () => {
         `Turn ${index + 1}:`,
         `distance=${turn.distanceFromStart.toFixed(1)}m`,
         `angle=${turn.angle.toFixed(1)}°`,
+        `signed=${turn.signedAngle.toFixed(1)}°`,
+        `direction=${turn.direction}`,
       );
     });
 
@@ -891,31 +1058,60 @@ const MapScreen = () => {
   const handleStop = () => {
     console.log("Navigation stopped.");
 
-    setIsNavigating(false);
-    setIsPaused(false);
-    setIsDestinationReached(false);
+    setIsPickingOrigin(true);
 
+    console.log("Origin picking enabled. Tap the map to choose a new start.");
+  };
+
+  const handleOriginSelect = (coordinates: Coordinates) => {
+    console.log("NEW INITIAL POSITION:", coordinates);
+
+    // -----------------------------------------
+    // INVALIDATE EVERY OLD ROUTE
+    // -----------------------------------------
+    routeGenerationRef.current++;
+
+    console.log("Route generation changed to:", routeGenerationRef.current);
+
+    // -----------------------------------------
+    // NEW INITIAL POSITION
+    // -----------------------------------------
+    setCustomOrigin(coordinates);
+
+    // -----------------------------------------
+    // OLD DESTINATION IS NO LONGER VALID
+    // -----------------------------------------
+    setDestination(null);
+
+    // -----------------------------------------
+    // DESTROY OLD POLYLINE
+    // -----------------------------------------
+    setRouteCoordinates([]);
+
+    // -----------------------------------------
+    // RESET ROUTE INFORMATION
+    // -----------------------------------------
+    setDistanceRemaining(0);
+    setProgress(0);
+    setEta(0);
+
+    // -----------------------------------------
+    // RESET SIMULATION
+    // -----------------------------------------
     simulationDistanceRef.current = 0;
     simulationSpeedRef.current = 0;
 
     setSimulationDistance(0);
     setSimulationSpeed(0);
-    setProgress(0);
-    setEta(0);
+    setSimulationPosition(coordinates);
 
-    if (routeCoordinates.length > 0) {
-      const lastPoint = routeCoordinates[routeCoordinates.length - 1];
+    // -----------------------------------------
+    // FINISH ORIGIN PICKING
+    // -----------------------------------------
+    setIsPickingOrigin(false);
 
-      setDistanceRemaining(lastPoint.distanceFromStart);
-
-      setSimulationPosition({
-        latitude: routeCoordinates[0].latitude,
-        longitude: routeCoordinates[0].longitude,
-      });
-    } else {
-      setDistanceRemaining(0);
-      setSimulationPosition(null);
-    }
+    console.log("OLD ROUTE DESTROYED");
+    console.log("READY FOR NEW DESTINATION");
   };
 
   const handleLocate = () => {
@@ -924,6 +1120,39 @@ const MapScreen = () => {
 
   const handleToggleRealGPS = () => {
     setUseRealGPS((prev) => !prev);
+  };
+
+  const handleToggleNavigationView = () => {
+    const nextValue = !isNavigationView;
+    setIsNavigationView(nextValue);
+
+    if (nextValue) {
+      mapViewRef.current?.enterNavigationView();
+    } else {
+      mapViewRef.current?.exitNavigationView();
+    }
+  };
+
+  const handleToggleSatelliteView = () => {
+    setIsSatelliteView((prev) => !prev);
+  };
+
+  const handleToggleInfoCard = () => {
+    setIsInfoCardVisible((prev) => !prev);
+  };
+
+  const displayHeading = useRealGPS
+    ? location?.coords.heading
+    : getSimulatedHeading(routeCoordinates, simulationDistance);
+
+  const displayElevation = useRealGPS ? location?.coords.altitude : null;
+
+  const formatElapsedTime = (totalSeconds: number) => {
+    const minutes = Math.floor(totalSeconds / 60)
+      .toString()
+      .padStart(2, "0");
+    const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+    return `${minutes}:${seconds}`;
   };
 
   if (loading && !location) {
@@ -952,18 +1181,42 @@ const MapScreen = () => {
           Speed: {simulationSpeed.toFixed(0)} km/h
         </Text>
         <View style={styles.topBarIcons}>
-          <Pressable style={styles.iconBtn}>
-            <Ionicons name="layers-outline" size={18} />
+          <Pressable
+            style={[styles.iconBtn, isNavigationView && styles.iconBtnActive]}
+            onPress={handleToggleNavigationView}
+          >
+            <Ionicons
+              name="layers-outline"
+              size={18}
+              color={isNavigationView ? "#fff" : "#000"}
+            />
           </Pressable>
-          <Pressable style={styles.iconBtn}>
-            <Ionicons name="navigate-outline" size={18} />
+          <Pressable
+            style={[styles.iconBtn, isSatelliteView && styles.iconBtnActive]}
+            onPress={handleToggleSatelliteView}
+          >
+            <Ionicons
+              name="navigate-outline"
+              size={18}
+              color={isSatelliteView ? "#fff" : "#000"}
+            />
+          </Pressable>
+          <Pressable
+            style={[styles.iconBtn, isInfoCardVisible && styles.iconBtnActive]}
+            onPress={handleToggleInfoCard}
+          >
+            <Ionicons
+              name="information-circle-outline"
+              size={18}
+              color={isInfoCardVisible ? "#fff" : "#000"}
+            />
           </Pressable>
           <Pressable style={styles.iconBtn}>
             <Ionicons name="settings-outline" size={18} />
           </Pressable>
-          <Pressable style={styles.iconBtn}>
+          {/* <Pressable style={styles.iconBtn}>
             <Ionicons name="construct-outline" size={18} />
-          </Pressable>
+          </Pressable> */}
         </View>
       </View>
 
@@ -982,6 +1235,12 @@ const MapScreen = () => {
       {/* MAP */}
       <View style={styles.mapContainer}>
         <MapScreenView
+          ref={mapViewRef}
+          useRealGPS={useRealGPS}
+          mapType={isSatelliteView ? "hybrid" : "standard"}
+          customOrigin={customOrigin}
+          isPickingOrigin={isPickingOrigin}
+          onOriginSelect={handleOriginSelect}
           location={
             location
               ? {
@@ -1001,6 +1260,35 @@ const MapScreen = () => {
           <View style={styles.destinationReached}>
             <Text style={styles.destinationReachedText}>
               Destination Reached
+            </Text>
+          </View>
+        )}
+
+        {isPickingOrigin && (
+          <View style={styles.pickOriginBanner}>
+            <Text style={styles.pickOriginBannerText}>
+              Tap the map to set your start point
+            </Text>
+          </View>
+        )}
+
+        {isInfoCardVisible && (
+          <View style={styles.infoCard}>
+            <Text style={styles.infoCardAccuracy}>
+              Accuracy: ±{location?.coords.accuracy?.toFixed(0) ?? "--"} m
+            </Text>
+            <Text style={styles.infoCardText}>
+              Heading:{" "}
+              {displayHeading != null ? `${displayHeading.toFixed(0)}°` : "--"}
+            </Text>
+            <Text style={styles.infoCardText}>
+              Elevation:{" "}
+              {displayElevation != null
+                ? `${displayElevation.toFixed(0)} m`
+                : "0 m"}
+            </Text>
+            <Text style={styles.infoCardText}>
+              Time: {formatElapsedTime(elapsedSeconds)}
             </Text>
           </View>
         )}
@@ -1039,6 +1327,7 @@ const MapScreen = () => {
       </View>
 
       {/* BOTTOM PANEL */}
+
       <View style={styles.bottomPanel}>
         <Text style={styles.progressLabel}>
           Progress: {progress.toFixed(0)}%
@@ -1057,6 +1346,10 @@ const MapScreen = () => {
             maximumTrackTintColor="#ccc"
           />
         </View>
+
+        {/* {isNavigationView && (
+          <Text style={styles.navViewLabel}>Navigation view ON</Text>
+        )} */}
 
         <View style={styles.controlsRow}>
           <Pressable
@@ -1078,7 +1371,7 @@ const MapScreen = () => {
           <Pressable
             style={[styles.ctrlBtn, styles.ctrlStop]}
             onPress={handleStop}
-            disabled={!isNavigating && simulationDistance === 0}
+            disabled={isPickingOrigin}
           >
             <Text style={styles.ctrlBtnText}>STOP</Text>
           </Pressable>
@@ -1210,6 +1503,50 @@ const styles = StyleSheet.create({
   ctrlStart: { backgroundColor: "#22C55E" },
   ctrlPause: { backgroundColor: "#F59E0B" },
   ctrlStop: { backgroundColor: "#EF4444" },
+  iconBtnActive: {
+    backgroundColor: "#2F80ED",
+  },
+  navViewLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#2F80ED",
+    marginBottom: 6,
+  },
+  infoCard: {
+    position: "absolute",
+    top: 10,
+    right: 10,
+    backgroundColor: "rgba(0, 0, 0, 0.75)",
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  infoCardAccuracy: {
+    color: "#4ADE80",
+    fontSize: 12,
+    fontWeight: "600",
+    marginBottom: 2,
+  },
+  infoCardText: {
+    color: "#fff",
+    fontSize: 12,
+    marginTop: 1,
+  },
+  pickOriginBanner: {
+    position: "absolute",
+    top: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: "#111827",
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  pickOriginBannerText: {
+    color: "#fff",
+    textAlign: "center",
+    fontWeight: "600",
+    fontSize: 13,
+  },
 });
 
 export default MapScreen;
